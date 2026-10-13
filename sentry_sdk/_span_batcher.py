@@ -195,13 +195,18 @@ class SpanBatcher(Batcher["SpanJSON"]):
             if not buckets:
                 return
 
-            envelopes = []
-
+            # Detach each bucket before serializing; user-controlled values can
+            # trigger logging while being serialized.
+            detached = []
             for bucket_id in buckets:
-                spans = self._span_buffer.get(bucket_id)
-                if not spans:
-                    continue
+                spans = self._span_buffer.pop(bucket_id, None)
+                if spans:
+                    size = self._running_size.pop(bucket_id)
+                    detached.append((bucket_id, spans, size))
 
+        envelopes = []
+        try:
+            for bucket_id, spans, _ in detached:
                 dsc = spans[0]["_segment_span"]._dynamic_sampling_context()
 
                 # Max per envelope is 1000, so if we happen to have more than
@@ -236,9 +241,16 @@ class SpanBatcher(Batcher["SpanJSON"]):
                     )
 
                     envelopes.append(envelope)
-
-                del self._span_buffer[bucket_id]
-                del self._running_size[bucket_id]
+        except Exception:
+            # Preserve batches if encoding fails. New spans for the same trace
+            # may have arrived while the old bucket was being encoded.
+            with self._lock:
+                for bucket_id, spans, size in detached:
+                    self._span_buffer[bucket_id][:0] = spans
+                    self._running_size[bucket_id] += size
+                    self._pending_flush.add(bucket_id)
+            self._flush_event.set()
+            raise
 
         for envelope in envelopes:
             self._capture_func(envelope)
